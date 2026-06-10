@@ -11,6 +11,7 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 
 MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek/deepseek-chat")
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", "deepseek/deepseek-chat")
+VISION_MODEL = os.getenv("VISION_MODEL", "openai/gpt-4o-mini")
 
 client = None
 if LLM_API_KEY:
@@ -72,4 +73,40 @@ async def call_llm_stream(messages: list[dict], model: str):
                 yield chunk.choices[0].delta.content
     except Exception as e:
         logger.error(f"Ошибка стримингового запроса к OpenRouter ({model}): {e}")
+        raise e
+
+async def describe_image(base64_image: str) -> str:
+    """Генерация описания картинки с помощью Vision-модели"""
+    c = get_client()
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Пожалуйста, опиши максимально подробно, что изображено на этой картинке. Обрати особое внимание на любой текст (прочитай его полностью), людей, объекты, сцену, и смысл. Твое описание будет сохранено в базу знаний бота, чтобы он мог 'вспомнить' это фото по текстовому запросу пользователя."
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }
+                }
+            ]
+        }
+    ]
+    try:
+        response = await c.chat.completions.create(
+            model=VISION_MODEL,
+            messages=messages,
+            temperature=0.3,
+            max_tokens=1000,
+            extra_headers={
+                "HTTP-Referer": "https://github.com/google/antigravity",
+                "X-Title": "TG RAG Bot",
+            }
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Ошибка при описании картинки (OpenRouter Vision): {e}")
         raise e

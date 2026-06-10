@@ -7,6 +7,7 @@ import io
 import aiohttp
 import re
 import zipfile
+import base64
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
@@ -23,7 +24,7 @@ except ImportError:
 
 from db.sqlite_db import init_db, save_message, get_history, clear_user_history
 from db.vector_db import init_vector_db, add_to_vector_db, search_vectors, delete_user_vectors, add_chunks_to_vector_db, get_embedding
-from services.openrouter_client import call_llm, call_llm_stream, MAIN_MODEL, REWRITE_MODEL
+from services.openrouter_client import call_llm, call_llm_stream, describe_image, MAIN_MODEL, REWRITE_MODEL
 from services.rerank import local_rerank
 
 # Настройка логирования
@@ -211,10 +212,10 @@ async def search_cmd(message: types.Message):
                 
                 user_id = message.from_user.id
                 await add_chunks_to_vector_db(user_id, chunks)
-                    
-                    await status_msg.edit_text("✅ Поиск завершен. Результаты добавлены в мою память. Задай мне вопрос по ним!")
-                else:
-                    await status_msg.edit_text("❌ Ошибка при поиске.")
+                
+                await status_msg.edit_text("✅ Поиск завершен. Результаты добавлены в мою память. Задай мне вопрос по ним!")
+            else:
+                await status_msg.edit_text("❌ Ошибка при поиске.")
     except Exception as e:
         logger.error(f"Ошибка веб-поиска: {e}")
         await status_msg.edit_text("❌ Произошла ошибка при поиске в интернете.")
@@ -245,19 +246,57 @@ async def chat_handler(message: types.Message):
                 data=form
             ) as resp:
                 if resp.status == 200:
-                        res_json = await resp.json()
-                        recognized_text = res_json.get("text", "")
-                        await status_msg.delete()
-                        raw_text = recognized_text
-                        await message.reply(f"🎤 Распознано: *{raw_text}*", parse_mode="Markdown")
-                    else:
-                        error_text = await resp.text()
-                        logger.error(f"Ошибка Groq API: {error_text}")
-                        await status_msg.edit_text("❌ Ошибка API Groq при распознавании.")
-                        return
+                    res_json = await resp.json()
+                    recognized_text = res_json.get("text", "")
+                    await status_msg.delete()
+                    raw_text = recognized_text
+                    await message.reply(f"🎤 Распознано: *{raw_text}*", parse_mode="Markdown")
+                else:
+                    error_text = await resp.text()
+                    logger.error(f"Ошибка Groq API: {error_text}")
+                    await status_msg.edit_text("❌ Ошибка API Groq при распознавании.")
+                    return
         except Exception as e:
             logger.error(f"Ошибка распознавания голоса: {e}")
             await status_msg.edit_text("❌ Не удалось распознать голосовое сообщение.")
+            return
+
+    if message.photo:
+        status_msg = await message.reply("👁️ Рассматриваю картинку...")
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        
+        # Берем фото в лучшем разрешении (последнее в массиве)
+        photo = message.photo[-1]
+        file_in_memory = await message.bot.download(photo)
+        
+        try:
+            # Конвертируем в base64
+            img_bytes = file_in_memory.read()
+            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            
+            # Получаем описание от Vision-модели
+            description = await describe_image(img_b64)
+            
+            # Чанкуем и сохраняем в базу (с контекстом из caption, если есть)
+            caption = message.caption or "Без подписи"
+            full_description = f"Описание картинки (Подпись пользователя: {caption}):\n{description}"
+            chunks = make_chunks(full_description, "Изображение от пользователя")
+            await add_chunks_to_vector_db(user_id, chunks)
+            
+            await status_msg.delete()
+            # Отвечаем, что поняли, и подменяем raw_text, чтобы сработал основной LLM
+            await message.reply(f"✅ Изображение сохранено в память.\n\n_Мое зрение сказало:_\n{description[:500]}...", parse_mode="Markdown")
+            
+            # Если пользователь не прислал текст вместе с картинкой, мы просто завершаем обработку
+            # (описание уже в базе). Иначе пусть бот ответит на текст в контексте картинки.
+            if not message.caption:
+                return
+                
+            raw_text = message.caption
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки картинки: {e}", exc_info=True)
+            await status_msg.edit_text("❌ Не удалось обработать картинку (проверь API ключ и Vision-модель).")
             return
 
     if message.document:
