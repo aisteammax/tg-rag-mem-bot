@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mem-bot-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  bot:
+    build: .
+    container_name: mem-bot-app
+    depends_on:
+      - qdrant
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./soul.md:/app/soul.md
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
