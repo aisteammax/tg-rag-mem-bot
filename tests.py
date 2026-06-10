@@ -7,7 +7,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from db.vector_db import add_chunks_to_vector_db, search_vectors, init_vector_db
 from bot import make_chunks, rewrite_query
 from services.rerank import local_rerank
-from services.openrouter_client import call_llm
+from services.openrouter_client import call_llm, describe_image
 
 async def test_text_splitting():
     print("\n--- ТЕСТ 1: Разбиение текста на чанки (make_chunks) ---")
@@ -58,19 +58,30 @@ async def test_rag_pipeline():
     assert "M3" in relevant[0], "Реранкер выбрал не тот документ"
     print("✅ ТЕСТ 3 ПРОЙДЕН")
 
+async def test_vision():
+    print("\n--- ТЕСТ 4: Генерация описания картинки (Vision LLM) ---")
+    # Прозрачный 1x1 pixel PNG в base64
+    tiny_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    print("Отправка тестовой картинки в OpenRouter Vision...")
+    description = await describe_image(tiny_png_b64)
+    print(f"Ответ Vision-модели (первые 100 символов): {description[:100]}...")
+    assert len(description) > 5, "Vision-модель вернула слишком короткое или пустое описание"
+    print("✅ ТЕСТ 4 ПРОЙДЕН")
+
 async def run_all_tests():
     print("🚀 ЗАПУСК ГРУППЫ БАЗОВЫХ ТЕСТОВ СЦЕНАРИЕВ\n")
     try:
         await test_text_splitting()
         await test_query_rewriting()
         await test_rag_pipeline()
+        await test_vision()
         
         print("\n🎉 ВСЕ ТЕСТЫ УСПЕШНО ПРОЙДЕНЫ!")
         print("\nПРИМЕЧАНИЕ ПО ВОЗМОЖНОСТЯМ:")
         print("- Чтение файлов: Поддерживается (.pdf, .docx, .txt), код в bot.py использует pypdf/python-docx/Jina Reader.")
         print("- Распознавание аудио: Поддерживается (Groq Whisper API).")
         print("- Чтение URL: Поддерживается (Jina Reader).")
-        print("- Распознавание картинок: ПОКА НЕ РЕАЛИЗОВАНО (Vision LLM не подключена).")
+        print("- Распознавание картинок: Поддерживается (OpenRouter Vision LLM).")
     except AssertionError as e:
         print(f"\n❌ ТЕСТ ПРОВАЛЕН: {e}")
     except Exception as e:

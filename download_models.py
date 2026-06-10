@@ -20,7 +20,17 @@ def download_models():
     print(f"Downloading reranker model '{model_name}' to local directory...")
     try:
         snapshot_download(repo_id=model_name, local_dir=local_dir)
-        print("Model downloaded successfully.")
+        print("Reranker model downloaded successfully.")
+        
+        print("Downloading Qdrant/bm25 sparse model...")
+        try:
+            from fastembed import SparseTextEmbedding
+            # Инициализация автоматически скачает модель в ~/.cache
+            _ = SparseTextEmbedding(model_name="Qdrant/bm25")
+            print("BM25 model downloaded successfully.")
+        except Exception as e:
+            print(f"Error downloading BM25: {e}")
+            
     except Exception as e:
         print(f"Error downloading model: {e}")
         import sys

@@ -4,7 +4,6 @@ FROM python:3.10-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     git \
-    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -16,7 +15,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt torch --extra-index-url https://download.pytorch.org/whl/cpu
 
 # Копируем скрипт загрузки модели и запускаем его для кэширования
-COPY .env download_models.py ./
+COPY download_models.py ./
+ENV HF_HUB_DISABLE_PROGRESS_BARS=1
 RUN python download_models.py
 
 # Копируем остальной исходный код
