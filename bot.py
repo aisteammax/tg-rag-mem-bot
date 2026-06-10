@@ -1,5 +1,7 @@
 import asyncio
 import os
+import sys
+import time
 import logging
 import io
 import aiohttp
@@ -8,8 +10,19 @@ import zipfile
 from aiogram import Bot, Dispatcher, types, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
+
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
+
+try:
+    import docx
+except ImportError:
+    docx = None
+
 from db.sqlite_db import init_db, save_message, get_history, clear_user_history
-from db.vector_db import init_vector_db, add_to_vector_db, search_vectors, delete_user_vectors, add_chunks_to_vector_db
+from db.vector_db import init_vector_db, add_to_vector_db, search_vectors, delete_user_vectors, add_chunks_to_vector_db, get_embedding
 from services.openrouter_client import call_llm, call_llm_stream, MAIN_MODEL, REWRITE_MODEL
 from services.rerank import local_rerank
 
@@ -20,10 +33,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+if pypdf is None:
+    logger.warning("pypdf не установлен. PDF без Jina API обрабатываться не будут.")
+if docx is None:
+    logger.warning("python-docx не установлен. DOCX-файлы обрабатываться не будут.")
+
 # Токен бота
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN не задан в переменных окружения!")
+    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -58,6 +77,37 @@ dp.message.middleware(SecurityMiddleware())
 JINA_API_KEY = os.getenv("JINA_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+http_session: aiohttp.ClientSession | None = None
+
+def _log_task_error(task: asyncio.Task) -> None:
+    if not task.cancelled() and task.exception():
+        logger.error(
+            "Ошибка фонового сохранения в векторную БД: %s",
+            task.exception(),
+            exc_info=task.exception(),
+        )
+
+CHUNK_SIZE = 1500
+CHUNK_OVERLAP = 300
+
+def make_chunks(text: str, source_label: str) -> list[str]:
+    """Разбивает текст на перекрывающиеся чанки для индексации в векторной БД."""
+    chunks = []
+    step = CHUNK_SIZE - CHUNK_OVERLAP
+    for i in range(0, len(text), step):
+        chunk = text[i : i + CHUNK_SIZE]
+        chunks.append(f"{source_label}:\n{chunk}")
+    return chunks
+
+# Загружаем "душу" бота один раз при старте
+_soul_path = os.path.join(os.path.dirname(__file__), "soul.md")
+try:
+    with open(_soul_path, "r", encoding="utf-8") as _f:
+        SOUL_CONTENT: str = _f.read()
+except FileNotFoundError:
+    SOUL_CONTENT = "Ты — умный ИИ-помощник с абсолютной долгосрочной памятью."
+    logger.warning("soul.md не найден, используется промпт по умолчанию.")
+
 async def fetch_url_content(url: str) -> str:
     try:
         headers = {}
@@ -65,11 +115,10 @@ async def fetch_url_content(url: str) -> str:
             headers["Authorization"] = f"Bearer {JINA_API_KEY}"
             
         jina_url = f"https://r.jina.ai/{url}"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(jina_url, headers=headers, timeout=15) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    return text
+        async with http_session.get(jina_url, headers=headers, timeout=15) as response:
+            if response.status == 200:
+                text = await response.text()
+                return text
     except Exception as e:
         logger.warning(f"Ошибка загрузки URL через Jina {url}: {e}")
     return ""
@@ -152,19 +201,16 @@ async def search_cmd(message: types.Message):
         
     jina_url = f"https://s.jina.ai/{query}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(jina_url, headers=headers, timeout=20) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    if len(text) > 50000:
-                        text = text[:50000]
-                        
-                    chunk_size = 1500
-                    overlap = 300
-                    chunks = [f"Результаты веб-поиска по запросу '{query}':\n{text[i:i + chunk_size]}" for i in range(0, len(text), chunk_size - overlap)]
+        async with http_session.get(jina_url, headers=headers, timeout=20) as response:
+            if response.status == 200:
+                text = await response.text()
+                if len(text) > 50000:
+                    text = text[:50000]
                     
-                    user_id = message.from_user.id
-                    await add_chunks_to_vector_db(user_id, chunks)
+                chunks = make_chunks(text, f"Результаты веб-поиска по запросу '{query}'")
+                
+                user_id = message.from_user.id
+                await add_chunks_to_vector_db(user_id, chunks)
                     
                     await status_msg.edit_text("✅ Поиск завершен. Результаты добавлены в мою память. Задай мне вопрос по ним!")
                 else:
@@ -193,13 +239,12 @@ async def chat_handler(message: types.Message):
             form.add_field('model', 'whisper-large-v3')
             form.add_field('language', 'ru')
             
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    "https://api.groq.com/openai/v1/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                    data=form
-                ) as resp:
-                    if resp.status == 200:
+            async with http_session.post(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                data=form
+            ) as resp:
+                if resp.status == 200:
                         res_json = await resp.json()
                         recognized_text = res_json.get("text", "")
                         await status_msg.delete()
@@ -243,19 +288,20 @@ async def chat_handler(message: types.Message):
                         }
                         file_in_memory.seek(0)
                         pdf_data = file_in_memory.read()
-                        async with aiohttp.ClientSession() as session:
-                            async with session.post("https://r.jina.ai/", headers=headers, data=pdf_data, timeout=30) as resp:
-                                if resp.status == 200:
-                                    file_content = await resp.text()
-                                    jina_success = True
-                                else:
-                                    logger.warning(f"Jina PDF Reader вернул статус {resp.status}")
+                        async with http_session.post("https://r.jina.ai/", headers=headers, data=pdf_data, timeout=30) as resp:
+                            if resp.status == 200:
+                                file_content = await resp.text()
+                                jina_success = True
+                            else:
+                                logger.warning(f"Jina PDF Reader вернул статус {resp.status}")
                     except Exception as e:
                         logger.warning(f"Ошибка парсинга PDF через Jina: {e}")
                 
                 # Локальный фолбэк на pypdf
                 if not jina_success:
-                    import pypdf
+                    if pypdf is None:
+                        await status_msg.edit_text("❌ Локальный парсер PDF недоступен. Установите pypdf.")
+                        return
                     file_in_memory.seek(0)
                     pdf = pypdf.PdfReader(file_in_memory)
                     file_content = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
@@ -270,7 +316,9 @@ async def chat_handler(message: types.Message):
                 except zipfile.BadZipFile:
                     pass
                 file_in_memory.seek(0)
-                import docx
+                if docx is None:
+                    await status_msg.edit_text("❌ Локальный парсер DOCX недоступен. Установите python-docx.")
+                    return
                 doc = docx.Document(file_in_memory)
                 file_content = "\n".join([p.text for p in doc.paragraphs])
             else:
@@ -284,13 +332,7 @@ async def chat_handler(message: types.Message):
              await message.reply("⚠️ Файл слишком большой для полной загрузки (лимит 100 000 символов). Он будет обрезан.")
              file_content = file_content[:100000]
 
-        # Разбиваем на чанки по 1500 символов с перекрытием 300
-        chunk_size = 1500
-        overlap = 300
-        chunks = []
-        for i in range(0, len(file_content), chunk_size - overlap):
-            chunk = file_content[i:i + chunk_size]
-            chunks.append(f"Фрагмент из файла '{file_name}':\n{chunk}")
+        chunks = make_chunks(file_content, f"Фрагмент из файла '{file_name}'")
         
         try:
             await add_chunks_to_vector_db(user_id, chunks)
@@ -318,9 +360,7 @@ async def chat_handler(message: types.Message):
                 if len(page_text) > 50000:
                     page_text = page_text[:50000]
                 
-                chunk_size = 1500
-                overlap = 300
-                chunks = [f"Статья по ссылке ({url}):\n{page_text[i:i + chunk_size]}" for i in range(0, len(page_text), chunk_size - overlap)]
+                chunks = make_chunks(page_text, f"Статья по ссылке ({url})")
                 
                 try:
                     await add_chunks_to_vector_db(user_id, chunks)
@@ -339,7 +379,6 @@ async def chat_handler(message: types.Message):
         search_query = await rewrite_query(raw_text, chat_history)
 
         # 3. Векторный поиск (извлекаем Top-20 кандидатов)
-        from db.vector_db import get_embedding
         query_vector = await get_embedding(search_query)
         
         candidates = await search_vectors(user_id, query_vector, top_k=20)
@@ -351,18 +390,8 @@ async def chat_handler(message: types.Message):
         context = "\n---\n".join(relevant_chunks) if relevant_chunks else "Нет сохраненных воспоминаний по этой теме."
         logger.info(f"Найдено {len(relevant_chunks)} релевантных фрагментов контекста.")
 
-        # Чтение "души" бота из soul.md
-        soul_content = "Ты — умный ИИ-помощник с абсолютной долгосрочной памятью."
-        soul_path = os.path.join(os.path.dirname(__file__), "soul.md")
-        try:
-            if os.path.exists(soul_path):
-                with open(soul_path, "r", encoding="utf-8") as f:
-                    soul_content = f.read()
-        except Exception as e:
-            logger.error(f"Не удалось прочитать soul.md: {e}")
-
         # Собираем системный промпт с защитой от Indirect Prompt Injection
-        system_prompt = f"""{soul_content}
+        system_prompt = f"""{SOUL_CONTENT}
 
 ---
 Ниже приведены фрагменты из твоей долгосрочной памяти, завернутые в тег <memory_context>. 
@@ -419,13 +448,17 @@ async def chat_handler(message: types.Message):
         # Долгосрочная память (Vector DB)
         memory_chunk = f"Пользователь спросил: {raw_text}\nОтвет бота: {response_text}"
         # Добавляем в фоне, чтобы не тормозить хендлер
-        asyncio.create_task(add_to_vector_db(user_id, memory_chunk))
+        task = asyncio.create_task(add_to_vector_db(user_id, memory_chunk))
+        task.add_done_callback(_log_task_error)
 
     except Exception as e:
         logger.error(f"Ошибка в chat_handler: {e}", exc_info=True)
         await message.answer("Извини, произошла внутренняя ошибка при обработке сообщения.")
 
 async def main():
+    global http_session
+    http_session = aiohttp.ClientSession()
+    
     logger.info("Запуск инициализации баз данных...")
     await init_db()
     await init_vector_db()
@@ -433,6 +466,7 @@ async def main():
     logger.info("Установка команд меню Telegram...")
     commands = [
         types.BotCommand(command="start", description="Начать общение"),
+        types.BotCommand(command="search", description="Поиск в интернете: /search <запрос>"),
         types.BotCommand(command="clear", description="Очистить историю диалога (короткую память)"),
         types.BotCommand(command="forget_me", description="Удалить все данные (и короткую, и долгосрочную память)")
     ]
@@ -442,6 +476,7 @@ async def main():
     try:
         await dp.start_polling(bot)
     finally:
+        await http_session.close()
         await bot.session.close()
 
 if __name__ == "__main__":
