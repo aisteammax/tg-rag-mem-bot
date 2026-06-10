@@ -20,6 +20,25 @@ qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
 
 COLLECTION_NAME = "user_memory"
 
+try:
+    from fastembed import SparseTextEmbedding
+    sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+except ImportError:
+    logger.warning("fastembed не установлен. Гибридный поиск будет работать только в режиме плотных векторов.")
+    sparse_model = None
+
+def get_sparse_embedding(text: str):
+    if not sparse_model:
+        return None
+    res = list(sparse_model.embed([text]))[0]
+    return {"indices": res.indices.tolist(), "values": res.values.tolist()}
+
+def get_sparse_embeddings_batch(texts: list[str]):
+    if not sparse_model:
+        return [None] * len(texts)
+    res_list = list(sparse_model.embed(texts))
+    return [{"indices": r.indices.tolist(), "values": r.values.tolist()} for r in res_list]
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 async def get_embedding(text: str) -> list[float]:
     """Генерация эмбеддинга через OpenRouter API"""
@@ -50,6 +69,7 @@ async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
 async def init_vector_db():
     """Инициализация Qdrant коллекции с динамическим определением размерности эмбеддинга"""
     try:
+        from qdrant_client import models
         collections_res = await qdrant_client.get_collections()
         collections = collections_res.collections
         exists = any(c.name == COLLECTION_NAME for c in collections)
@@ -62,23 +82,51 @@ async def init_vector_db():
             
             await qdrant_client.create_collection(
                 collection_name=COLLECTION_NAME,
-                vectors_config=VectorParams(size=dimension, distance=Distance.COSINE),
+                vectors_config=models.VectorParams(size=dimension, distance=models.Distance.COSINE),
+                sparse_vectors_config={
+                    "sparse": models.SparseVectorParams(
+                        index=models.SparseIndexParams(on_disk=False)
+                    )
+                }
             )
             logger.info(f"Коллекция '{COLLECTION_NAME}' успешно создана.")
+        else:
+            # Пытаемся обновить коллекцию, добавив поддержку sparse векторов (если её нет)
+            try:
+                await qdrant_client.update_collection(
+                    collection_name=COLLECTION_NAME,
+                    sparse_vectors_config={
+                        "sparse": models.SparseVectorParams(
+                            index=models.SparseIndexParams(on_disk=False)
+                        )
+                    }
+                )
+            except Exception as e:
+                pass # Уже существует или не поддерживается
     except Exception as e:
         logger.error(f"Не удалось инициализировать векторную базу данных: {e}")
 
 async def add_to_vector_db(user_id: int, text: str):
     """Добавление текста в векторное хранилище с фильтрацией по user_id"""
     try:
-        vector = await get_embedding(text)
+        from qdrant_client import models
+        dense_vector = await get_embedding(text)
+        sparse_vector_data = get_sparse_embedding(text)
         vector_id = str(uuid.uuid4())
+        
+        vector_payload = {"": dense_vector}
+        if sparse_vector_data:
+            vector_payload["sparse"] = models.SparseVector(
+                indices=sparse_vector_data["indices"],
+                values=sparse_vector_data["values"]
+            )
+            
         await qdrant_client.upsert(
             collection_name=COLLECTION_NAME,
             points=[
-                PointStruct(
+                models.PointStruct(
                     id=vector_id,
-                    vector=vector,
+                    vector=vector_payload,
                     payload={"user_id": user_id, "text": text}
                 )
             ]
@@ -89,17 +137,27 @@ async def add_to_vector_db(user_id: int, text: str):
 
 async def add_chunks_to_vector_db(user_id: int, chunks: list[str], batch_size: int = 20):
     """Пакетное добавление чанков в векторное хранилище"""
+    from qdrant_client import models
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
         try:
-            vectors = await get_embeddings_batch(batch)
+            dense_vectors = await get_embeddings_batch(batch)
+            sparse_vectors_data = get_sparse_embeddings_batch(batch)
             points = []
             for j, text in enumerate(batch):
                 vector_id = str(uuid.uuid4())
+                vector_payload = {"": dense_vectors[j]}
+                
+                if sparse_vectors_data[j]:
+                    vector_payload["sparse"] = models.SparseVector(
+                        indices=sparse_vectors_data[j]["indices"],
+                        values=sparse_vectors_data[j]["values"]
+                    )
+                    
                 points.append(
-                    PointStruct(
+                    models.PointStruct(
                         id=vector_id,
-                        vector=vectors[j],
+                        vector=vector_payload,
                         payload={"user_id": user_id, "text": text}
                     )
                 )
@@ -111,19 +169,45 @@ async def add_chunks_to_vector_db(user_id: int, chunks: list[str], batch_size: i
         except Exception as e:
             logger.error(f"Ошибка батчевой записи в Vector DB: {e}")
 
-async def search_vectors(user_id: int, query_vector: list[float], top_k: int = 20) -> list[str]:
-    """Поиск схожих текстов в Qdrant с фильтром по user_id"""
+async def search_vectors(user_id: int, query_text: str, top_k: int = 20) -> list[str]:
+    """Гибридный поиск схожих текстов в Qdrant с фильтром по user_id"""
     try:
-        from qdrant_client.models import Filter, FieldCondition, MatchValue
+        from qdrant_client import models
+        dense_vector = await get_embedding(query_text)
+        sparse_vector_data = get_sparse_embedding(query_text)
+        
+        prefetch = []
+        # Плотный векторный поиск (семантика)
+        prefetch.append(
+            models.Prefetch(
+                query=dense_vector,
+                using="",
+                limit=top_k,
+            )
+        )
+        
+        # Разреженный векторный поиск (BM25 - ключевые слова)
+        if sparse_vector_data:
+            prefetch.append(
+                models.Prefetch(
+                    query=models.SparseVector(
+                        indices=sparse_vector_data["indices"],
+                        values=sparse_vector_data["values"]
+                    ),
+                    using="sparse",
+                    limit=top_k,
+                )
+            )
         
         search_result = await qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
-            query=query_vector,
-            query_filter=Filter(
+            prefetch=prefetch,
+            query=models.FusionQuery(fusion=models.Fusion.RRF),
+            query_filter=models.Filter(
                 must=[
-                    FieldCondition(
+                    models.FieldCondition(
                         key="user_id",
-                        match=MatchValue(value=user_id)
+                        match=models.MatchValue(value=user_id)
                     )
                 ]
             ),

@@ -5,27 +5,28 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 logger = logging.getLogger(__name__)
 
-# OpenRouter Client Configuration
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL = "https://openrouter.ai/api/v1"
+# LLM Client Configuration
+LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("OPENROUTER_API_KEY"))
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 
 MAIN_MODEL = os.getenv("MAIN_MODEL", "deepseek/deepseek-chat")
 REWRITE_MODEL = os.getenv("REWRITE_MODEL", "deepseek/deepseek-chat")
 
 client = None
-if OPENROUTER_API_KEY:
-    client = AsyncOpenAI(base_url=OPENROUTER_URL, api_key=OPENROUTER_API_KEY)
+if LLM_API_KEY:
+    client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
 else:
-    logger.warning("OPENROUTER_API_KEY не установлен! Пожалуйста, добавьте его в .env")
+    logger.warning("LLM_API_KEY не установлен! Пожалуйста, добавьте его в .env")
 
 def get_client():
     global client
     if not client:
-        key = os.getenv("OPENROUTER_API_KEY")
+        key = os.getenv("LLM_API_KEY", os.getenv("OPENROUTER_API_KEY"))
+        base_url = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1")
         if key:
-            client = AsyncOpenAI(base_url=OPENROUTER_URL, api_key=key)
+            client = AsyncOpenAI(base_url=base_url, api_key=key)
         else:
-            raise ValueError("OPENROUTER_API_KEY не задан.")
+            raise ValueError("LLM_API_KEY не задан.")
     return client
 
 @retry(

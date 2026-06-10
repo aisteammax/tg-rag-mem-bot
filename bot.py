@@ -378,10 +378,8 @@ async def chat_handler(message: types.Message):
         # 2. Query Rewriting (OpenRouter - Aux Model)
         search_query = await rewrite_query(raw_text, chat_history)
 
-        # 3. Векторный поиск (извлекаем Top-20 кандидатов)
-        query_vector = await get_embedding(search_query)
-        
-        candidates = await search_vectors(user_id, query_vector, top_k=20)
+        # 3. Гибридный векторный поиск (извлекаем Top-20 кандидатов)
+        candidates = await search_vectors(user_id, search_query, top_k=20)
 
         # 4. Реранкинг кандидатов (локальный Cross-Encoder)
         relevant_chunks = await local_rerank(search_query, candidates, top_n=4)
@@ -390,8 +388,10 @@ async def chat_handler(message: types.Message):
         context = "\n---\n".join(relevant_chunks) if relevant_chunks else "Нет сохраненных воспоминаний по этой теме."
         logger.info(f"Найдено {len(relevant_chunks)} релевантных фрагментов контекста.")
 
-        # Собираем системный промпт с защитой от Indirect Prompt Injection
+        # Собираем системный промпт с защитой от Indirect Prompt Injection и требованием цитирования
         system_prompt = f"""{SOUL_CONTENT}
+
+ОБЯЗАТЕЛЬНОЕ ПРАВИЛО: При ответе всегда указывай источники информации из контекста, ссылаясь на названия файлов или ссылки, если они есть (например: 'Основано на файле report.pdf' или 'Согласно статье по ссылке...').
 
 ---
 Ниже приведены фрагменты из твоей долгосрочной памяти, завернутые в тег <memory_context>. 
