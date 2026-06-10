@@ -279,13 +279,13 @@ async def chat_handler(message: types.Message):
             
             # Чанкуем и сохраняем в базу (с контекстом из caption, если есть)
             caption = message.caption or "Без подписи"
-            full_description = f"Описание картинки (Подпись пользователя: {caption}):\n{description}"
-            chunks = make_chunks(full_description, "Изображение от пользователя")
+            full_description = f"Пользователь прислал картинку.\nТвоя подсистема компьютерного зрения (Vision) описала ее так:\n{description}\n\nПодпись пользователя: {caption}"
+            chunks = make_chunks(full_description, "Воспоминание о картинке (Vision LLM)")
             await add_chunks_to_vector_db(user_id, chunks)
             
             await status_msg.delete()
             # Отвечаем, что поняли, и подменяем raw_text, чтобы сработал основной LLM
-            await message.reply(f"✅ Изображение сохранено в память.\n\n_Мое зрение сказало:_\n{description[:500]}...", parse_mode="Markdown")
+            await message.reply(f"✅ Изображение сохранено в память.\n\n_Мое зрение сказало:_\n{description}", parse_mode="Markdown")
             
             # Если пользователь не прислал текст вместе с картинкой, мы просто завершаем обработку
             # (описание уже в базе). Иначе пусть бот ответит на текст в контексте картинки.
