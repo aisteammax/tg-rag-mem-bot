@@ -99,8 +99,8 @@ async def describe_image(base64_image: str) -> str:
         response = await c.chat.completions.create(
             model=VISION_MODEL,
             messages=messages,
-            temperature=0.3,
             max_tokens=1000,
+            temperature=0.3,
             extra_headers={
                 "HTTP-Referer": "https://github.com/google/antigravity",
                 "X-Title": "TG RAG Bot",

@@ -10,7 +10,11 @@ MODEL_NAME = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")
 
 logger.info(f"Загрузка локального реранкера {MODEL_NAME}...")
 try:
-    reranker_model = CrossEncoder(MODEL_NAME)
+    if os.path.exists("local_model"):
+        logger.info("Используется закэшированная модель из ./local_model")
+        reranker_model = CrossEncoder("local_model")
+    else:
+        reranker_model = CrossEncoder(MODEL_NAME)
     logger.info("Реранкер успешно загружен.")
 except Exception as e:
     logger.error(f"Ошибка загрузки реранкера: {e}")
